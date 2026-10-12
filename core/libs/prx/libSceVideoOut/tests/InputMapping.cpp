@@ -92,6 +92,27 @@ void performanceOverlayBinding() {
     require(rejects("TogglePerformanceOverlay = MOUSE:Left\n"), "the performance overlay toggle refuses a mouse button");
 }
 
+void screenshotBinding() {
+    useConfig("Cross = KEY:F\n");
+    bool onF12 = false;
+    for (const auto& binding : Pad::LoadInputMapping().bindings) onF12 = onF12 || (binding.control == Pad::InputControl::Screenshot && binding.key == SDL_SCANCODE_F12);
+    require(onF12, "F12 requests a screenshot by default");
+    useConfig("screenshot = KEY:F9\nScreenshot = KEY:F8\nScreenshot = KEY:F9\n");
+    bool onF9 = false;
+    bool onF8 = false;
+    int bindings = 0;
+    for (const auto& binding : Pad::LoadInputMapping().bindings) {
+        if (binding.control != Pad::InputControl::Screenshot) continue;
+        ++bindings;
+        onF9 = onF9 || binding.key == SDL_SCANCODE_F9;
+        onF8 = onF8 || binding.key == SDL_SCANCODE_F8;
+    }
+    require(onF9 && onF8 && bindings == 2, "custom screenshot keys replace F12 and ignore duplicate bindings");
+    require(rejects("Screenshot = MOUSE:Left\n"), "screenshots refuse a mouse button");
+    require(rejects("Screenshot = WHEEL:Up\n"), "screenshots refuse the mouse wheel");
+    require(rejects("Screenshot = KEY:not-a-key\n"), "screenshots refuse an unknown key");
+}
+
 void mouseLookDefault() {
     useConfig("Cross = KEY:F\n");
     const auto settings = Pad::LoadInputMapping().settings;
@@ -262,6 +283,7 @@ int main() try {
     settingsParse();
     settingsReject();
     performanceOverlayBinding();
+    screenshotBinding();
     mouseLookDefault();
     mouseLookParse();
     mouseLookReject();

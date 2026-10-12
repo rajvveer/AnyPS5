@@ -466,6 +466,35 @@ void testToggleRequests() {
     check(!keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F10, false), now).togglePerformanceOverlay, "releasing F10 asks for nothing");
 }
 
+void testScreenshotRequests() {
+    Pad::KeyboardMouse keyboardMouse(defaults());
+    const auto now = Pad::KeyboardMouse::Clock::now();
+    auto repeat = KeyEvent(SDL_SCANCODE_F12, true);
+    repeat.key.repeat = 1;
+    check(!keyboardMouse.HandleEvent(repeat, now).screenshot, "a repeated F12 event without a press asks for nothing");
+    check(!keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F12, false), now).screenshot, "F12 keyup without a press asks for nothing");
+    const auto request = keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F12, true), now);
+    check(request.screenshot && !request.toggleFullscreen && !request.togglePerformanceOverlay && !request.toggleMouse, "F12 only requests a screenshot");
+    check(!keyboardMouse.HandleEvent(repeat, now).screenshot, "holding F12 does not request another screenshot");
+    check(!keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F12, true), now).screenshot, "a duplicate F12 keydown asks for nothing");
+    check(!keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F12, false), now).screenshot, "releasing F12 asks for nothing");
+    check(keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F12, true), now).screenshot, "pressing F12 again requests another screenshot");
+    check(!keyboardMouse.HandleEvent(PadSimulation::FocusLostEvent(), now).screenshot, "focus loss does not request a screenshot");
+    check(!keyboardMouse.HandleEvent(repeat, now).screenshot, "a repeat after focus loss does not request a screenshot");
+    check(keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F12, true), now).screenshot, "focus loss releases the screenshot key");
+    const auto state = keyboardMouse.Compose(PadInputState{});
+    check(state.buttons == 0 && state.sticks == PadInputState{}.sticks && state.analogButtonsL2 == 0 && state.analogButtonsR2 == 0, "the screenshot key does not press a pad control");
+
+    auto configuration = defaults();
+    for (auto& binding : configuration.bindings) {
+        if (binding.control == Pad::InputControl::Screenshot) binding.key = SDL_SCANCODE_F9;
+    }
+    Pad::KeyboardMouse remapped(configuration);
+    check(!remapped.HandleEvent(KeyEvent(SDL_SCANCODE_F12, true), now).screenshot, "a remapped screenshot no longer uses F12");
+    check(remapped.HandleEvent(KeyEvent(SDL_SCANCODE_F9, true), now).screenshot, "a custom screenshot key requests a screenshot");
+    check(!remapped.HandleEvent(KeyEvent(SDL_SCANCODE_F9, false), now).screenshot, "releasing a custom screenshot key asks for nothing");
+}
+
 void testDefaultL2() {
     const auto l2 = static_cast<std::uint32_t>(Pad::PadButton::L2);
     const auto r2 = static_cast<std::uint32_t>(Pad::PadButton::R2);
@@ -553,6 +582,7 @@ int main() {
             {"focus loss releases the mouse", testFocusLossReleasesMouse},
             {"shake", testShake},
             {"toggle requests", testToggleRequests},
+            {"screenshot requests", testScreenshotRequests},
             {"default L2", testDefaultL2},
             {"title reads the mouse", testTitleReadsMouse},
         };

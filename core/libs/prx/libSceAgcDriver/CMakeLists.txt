@@ -229,6 +229,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationScaler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationPass.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Screenshot.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceOverlay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
@@ -318,6 +319,7 @@ add_shader_recompiler(shader_recompiler_agc_driver libc
 
 target_link_libraries(libSceAgcDriver PRIVATE
         shader_recompiler_agc_driver
+        decoder_png
         SDL2-static
         libc
         libkernel
@@ -327,6 +329,7 @@ target_link_libraries(libSceAgcDriver PRIVATE
 if(APS5_ENABLE_TRACY)
     target_link_libraries(libSceAgcDriver PUBLIC TracyClient)
 endif()
+target_link_options(libSceAgcDriver PRIVATE LINKER:--exclude-libs,$<TARGET_FILE_NAME:decoder_png>)
 
 if(BUILD_TESTING)
     add_test_executable(agc_driver_draw_program_trace_tests
@@ -1030,6 +1033,21 @@ target_include_directories(agc_placeholder_images_tests PRIVATE ${LIBS_INCLUDE_D
 target_link_libraries(agc_placeholder_images_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_placeholder_images_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_placeholder_images_tests)
+
+add_test_executable(agc_screenshot_tests EXCLUDE_FROM_ALL tests/Screenshot.cpp Execution/src/Screenshot.cpp)
+target_include_directories(agc_screenshot_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_screenshot_tests PRIVATE decoder_png SDL2-static libc)
+set_target_properties(agc_screenshot_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_screenshot_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_screenshot_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_screenshot COMMAND agc_screenshot_tests)
+    set_tests_properties(agc_screenshot PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_screenshot PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 add_test_executable(agc_shader_device_profile_tests EXCLUDE_FROM_ALL tests/ShaderDeviceProfile.cpp Execution/src/ShaderDeviceProfile.cpp)
 target_include_directories(agc_shader_device_profile_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
@@ -2375,6 +2393,7 @@ if(AGC_BUILD_VISUAL_TEST)
 
     target_link_libraries(agc_driver_visual_test PRIVATE
             shader_recompiler_agc_driver
+            decoder_png
             SDL2-static
             libc
             libkernel

@@ -248,6 +248,38 @@ if(BUILD_TESTING)
         set_tests_properties(video_out_hdr_present PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+
+    add_test_executable(video_out_screenshot_present_tests tests/ScreenshotPresent.cpp)
+    target_include_directories(video_out_screenshot_present_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
+    target_link_libraries(video_out_screenshot_present_tests PRIVATE decoder_png libSceVideoOut libSceAgcDriver libkernel libc)
+    if(ANYPS5_USE_SYSTEM_DEPS)
+        target_link_libraries(video_out_screenshot_present_tests PRIVATE SDL2-static)
+    endif()
+    set_target_properties(video_out_screenshot_present_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(video_out_screenshot_present_tests)
+    foreach(screenshotMode IN ITEMS present bmp failures 8k resident input)
+        add_test(NAME video_out_screenshot_${screenshotMode} COMMAND video_out_screenshot_present_tests ${screenshotMode})
+        set_tests_properties(video_out_screenshot_${screenshotMode} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 RESOURCE_LOCK videoout_app0
+            ENVIRONMENT "SDL_VIDEODRIVER=${ANYPS5_VIDEO_OUT_TEST_DRIVER}")
+        if(WIN32)
+            set_tests_properties(video_out_screenshot_${screenshotMode} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME video_out_screenshot_sync COMMAND video_out_screenshot_present_tests present)
+    set_tests_properties(video_out_screenshot_sync PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 RESOURCE_LOCK videoout_app0
+        ENVIRONMENT "SDL_VIDEODRIVER=${ANYPS5_VIDEO_OUT_TEST_DRIVER};APS5_SYNC_FLIP=1")
+    if(WIN32)
+        set_tests_properties(video_out_screenshot_sync PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME video_out_screenshot_resident_sync COMMAND video_out_screenshot_present_tests resident)
+    set_tests_properties(video_out_screenshot_resident_sync PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 RESOURCE_LOCK videoout_app0
+        ENVIRONMENT "SDL_VIDEODRIVER=${ANYPS5_VIDEO_OUT_TEST_DRIVER};APS5_SYNC_FLIP=1")
+    if(WIN32)
+        set_tests_properties(video_out_screenshot_resident_sync PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 if(BUILD_TESTING)

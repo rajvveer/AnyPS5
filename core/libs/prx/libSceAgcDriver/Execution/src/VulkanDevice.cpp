@@ -22,6 +22,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationPass.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -153,16 +155,23 @@ public:
         if (worker.joinable()) worker.join();
     }
 
-    void Enqueue(int index, std::uint32_t width, std::uint32_t height, std::uint32_t scale, std::vector<std::byte> pixels) {
+    void Enqueue(int index, std::uint32_t width, std::uint32_t height, std::uint32_t scale, bool screenshot, std::vector<std::byte> pixels) {
         std::lock_guard lock(mutex);
         require(!stopping, "frame dump writer has stopped");
-        require(pixels.size() <= maxBytes - queuedBytes, "frame dump queue exceeded 64 MiB");
-        if (!frameDumpOutput.Enabled_nid_no_patch()) return;
+        if (screenshot) require(!screenshotQueued, "a screenshot is already queued");
+        else require(pixels.size() <= maxBytes - queuedBytes, "frame dump queue exceeded 64 MiB");
+        if (!screenshot && !frameDumpOutput.Enabled_nid_no_patch()) return;
         if (!worker.joinable()) worker = std::thread([this] { run(); });
         const auto bytes = pixels.size();
-        pending.push_back({index, width, height, scale, std::move(pixels)});
-        queuedBytes += bytes;
+        pending.push_back({index, width, height, scale, screenshot, std::move(pixels)});
+        if (screenshot) screenshotQueued = true;
+        else queuedBytes += bytes;
         changed.notify_one();
+    }
+
+    bool ScreenshotPending() {
+        std::lock_guard lock(mutex);
+        return screenshotQueued;
     }
 
 private:
@@ -171,6 +180,7 @@ private:
         std::uint32_t width;
         std::uint32_t height;
         std::uint32_t scale;
+        bool screenshot;
         std::vector<std::byte> pixels;
     };
 
@@ -185,9 +195,17 @@ private:
                     batch.swap(pending);
                 }
                 for (const auto& frame : batch) {
-                    WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels, frame.scale);
+                    if (frame.screenshot) {
+                        try {
+                            const auto path = Screenshot::Write(GetAppTitleId_nid_postfix().value, frame.width, frame.height, frame.pixels).u8string();
+                            std::fprintf(stderr, "[gpu] screenshot saved: %s\n", reinterpret_cast<const char*>(path.c_str()));
+                        } catch (const std::exception& error) {
+                            std::fprintf(stderr, "[gpu] screenshot failed: %s\n", error.what());
+                        }
+                    } else WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels, frame.scale);
                     std::lock_guard lock(mutex);
-                    queuedBytes -= frame.pixels.size();
+                    if (frame.screenshot) screenshotQueued = false;
+                    else queuedBytes -= frame.pixels.size();
                 }
             }
         } catch (const std::exception& error) {
@@ -202,6 +220,7 @@ private:
     std::deque<Frame> pending;
     std::thread worker;
     std::size_t queuedBytes = 0;
+    bool screenshotQueued = false;
     bool stopping = false;
 };
 
@@ -438,6 +457,9 @@ struct VulkanDevice::State {
         std::uint32_t dumpHeight = 0;
         std::uint32_t dumpScale = 1;
         bool dumpRecorded = false;
+        bool dumpScreenshot = false;
+        bool dumpPresented = false;
+        std::vector<std::byte> screenshotPixels;
         int dumpIndex = 0;
         std::uint32_t imageIndex = 0;
         bool inFlight = false;
@@ -469,6 +491,8 @@ struct VulkanDevice::State {
     bool queuePending = false;
     std::uint32_t queueIndex = 0;
     int nextDumpIndex = 0;
+    bool nextDumpScreenshot = false;
+    std::size_t queueSlot = 0;
     FrameDumpWriter dumpWriter;
 
     template<typename TFunction>
@@ -605,7 +629,7 @@ struct VulkanDevice::State {
         slot.inFlight = false;
         if (presentation) presentation->Release(static_cast<std::size_t>(&slot - presentSlots.data()));
         slot.kept.reset();
-        if (slot.dumpRecorded) {
+        if (slot.dumpRecorded && (!slot.dumpScreenshot || slot.dumpPresented)) {
             slot.dumpRecorded = false;
             WriteFrameDump(slot);
         }
@@ -663,11 +687,19 @@ struct VulkanDevice::State {
         }
     }
 
-    void WriteFrameDump(const PresentSlot& slot) {
+    void WriteFrameDump(PresentSlot& slot) {
+        if (slot.dumpScreenshot && !slot.screenshotPixels.empty()) {
+            dumpWriter.Enqueue(0, slot.dumpWidth, slot.dumpHeight, 1, true, std::move(slot.screenshotPixels));
+            return;
+        }
         require(slot.dumpBuffer != nullptr, "frame dump was not recorded");
         const auto full = slot.dumpBuffer->Bytes();
         const auto index = slot.dumpIndex;
         const auto scale = slot.dumpScale;
+        if (slot.dumpScreenshot) {
+            dumpWriter.Enqueue(0, slot.dumpWidth, slot.dumpHeight, 1, true, std::vector<std::byte>(full.begin(), full.end()));
+            return;
+        }
         require(scale != 0 && full.size() == static_cast<std::size_t>(slot.dumpWidth) * slot.dumpHeight * 4, "invalid frame dump pixels");
         const auto width = (slot.dumpWidth + scale - 1) / scale;
         const auto height = (slot.dumpHeight + scale - 1) / scale;
@@ -677,7 +709,7 @@ struct VulkanDevice::State {
         }
         static const auto start = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", index, slot.dumpWidth, slot.dumpHeight, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
-        dumpWriter.Enqueue(index, width, height, 1, std::move(pixels));
+        dumpWriter.Enqueue(index, width, height, 1, false, std::move(pixels));
     }
 
     // Blocks on the fence, or polls it every 50 us with APS5_PRESENT_POLL_FENCE=1 (the difference
@@ -3024,9 +3056,20 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
                 dumpFrame = true;
             }
         }
-        if (!present(buffer.width, buffer.height, true, pixels, nullptr, nullptr, VK_FILTER_LINEAR, dumpFrame, false, nullptr, 0, passthrough)) {
+        const bool screenshot = takeScreenshot(dumpFrame);
+        auto screenshotPixels = screenshot && passthrough ? ReadDisplayBuffer(buffer) : std::vector<std::byte>{};
+        if (!present(buffer.width, buffer.height, true, pixels, nullptr, nullptr, VK_FILTER_LINEAR, dumpFrame || (screenshot && !passthrough), false, nullptr, 0, passthrough)) {
             if (dumpFrame) --dumps.dumped;
+            if (screenshot) Screenshot::Request();
             return false;
+        }
+        if (!screenshotPixels.empty()) {
+            std::lock_guard lock(state->presentMutex);
+            auto& slot = state->presentSlots[state->queueSlot];
+            slot.screenshotPixels = std::move(screenshotPixels);
+            slot.dumpWidth = buffer.width;
+            slot.dumpHeight = buffer.height;
+            slot.dumpScreenshot = slot.dumpRecorded = true;
         }
         return true;
     }
@@ -3095,12 +3138,35 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         const auto channel = [&](std::size_t index) { return static_cast<float>(std::to_integer<unsigned>((*cleared)[index])) / 255.0f; };
         uniform = {{channel(2), channel(1), channel(0), channel(3)}};
     }
-    if (!present(buffer.width, buffer.height, true, {}, cleared ? nullptr : &buffer, resident, filter, dumpFrame, convert, cleared ? &uniform : nullptr, layer, passthrough)) {
+    const bool screenshot = takeScreenshot(dumpFrame);
+    const bool cpuScreenshot = screenshot && passthrough && resident == nullptr;
+    std::vector<std::byte> screenshotPixels;
+    if (cpuScreenshot) {
+        screenshotPixels = cleared ? std::vector<std::byte>(static_cast<std::size_t>(buffer.width) * buffer.height * cleared->size()) : ReadDisplayBuffer(buffer);
+        for (std::size_t offset = 0; cleared && offset < screenshotPixels.size(); offset += cleared->size()) std::memcpy(screenshotPixels.data() + offset, cleared->data(), cleared->size());
+    }
+    if (!present(buffer.width, buffer.height, true, {}, cleared ? nullptr : &buffer, resident, filter, dumpFrame || (screenshot && !cpuScreenshot), convert, cleared ? &uniform : nullptr, layer, passthrough)) {
         // A dropped frame (swapchain out of date) keeps the dump numbering contiguous.
         if (dumpFrame) --dumps.dumped;
+        if (screenshot) Screenshot::Request();
         return false;
     }
+    if (cpuScreenshot) {
+        std::lock_guard lock(state->presentMutex);
+        auto& slot = state->presentSlots[state->queueSlot];
+        slot.screenshotPixels = std::move(screenshotPixels);
+        slot.dumpWidth = buffer.width;
+        slot.dumpHeight = buffer.height;
+        slot.dumpScreenshot = slot.dumpRecorded = true;
+    }
     return true;
+}
+
+bool VulkanDevice::takeScreenshot(bool dumpFrame) {
+    std::lock_guard lock(state->presentMutex);
+    const bool pending = state->dumpWriter.ScreenshotPending() || std::any_of(state->presentSlots.begin(), state->presentSlots.end(), [](const auto& slot) { return slot.dumpRecorded && slot.dumpScreenshot; });
+    state->nextDumpScreenshot = !dumpFrame && !pending && Screenshot::Take();
+    return state->nextDumpScreenshot;
 }
 
 bool VulkanDevice::AcquireImage() {
@@ -3276,7 +3342,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             else scaler->RecordBlit(commands, barrier.image, state->extent.width, state->extent.height);
         }
         if (dumpFrame) {
-            const auto scale = DumpScale();
+            const auto scale = state->nextDumpScreenshot ? 1 : DumpScale();
             if (drawn || direct) {
                 const auto extent = PresentationPass::DumpExtent(width, height, scale);
                 slot.dumpWidth = extent.width;
@@ -3344,6 +3410,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         slot.shared = shared;
         // Only a submitted readback is written after the fence (a failed submit tears the device down).
         slot.dumpRecorded = dumpFrame;
+        slot.dumpScreenshot = dumpFrame && state->nextDumpScreenshot;
+        slot.dumpPresented = false;
+        slot.screenshotPixels.clear();
+        state->queueSlot = state->presentCursor;
         slot.dumpIndex = state->nextDumpIndex;
         slot.recorderSerial = batchesAtBlit;
         slot.previousSerial = state->lastPresentSerial;
@@ -3454,6 +3524,23 @@ void VulkanDevice::QueuePresent() {
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
+    {
+        std::lock_guard lock(state->presentMutex);
+        auto& slot = state->presentSlots[state->queueSlot];
+        if (slot.dumpRecorded && slot.dumpScreenshot) {
+            if (presented == VK_ERROR_OUT_OF_DATE_KHR) {
+                slot.dumpRecorded = false;
+                slot.screenshotPixels.clear();
+                Screenshot::Request();
+            } else {
+                slot.dumpPresented = true;
+                if (!slot.inFlight) {
+                    slot.dumpRecorded = false;
+                    state->WriteFrameDump(slot);
+                }
+            }
+        }
+    }
     timing.Mark("queue_present");
     APS5_LOG_OUT_DEBUG("vkQueuePresentKHR queued imageIndex=%u", index);
 }

@@ -30,9 +30,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -70,7 +72,7 @@ constexpr std::array<std::array<float, 4>, 6> LeftHalf{{
     {0.0f, -1.0f, 0.5f, 1.0f}, {0.0f, 1.0f, 0.5f, 1.0f}, {-1.0f, 1.0f, 0.5f, 1.0f}
 }};
 
-alignas(256) std::array<std::array<std::uint32_t, 16>, 11> Programs{};
+alignas(256) std::array<std::array<std::uint32_t, 16>, 15> Programs{};
 std::size_t programCount = 0;
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
@@ -170,7 +172,7 @@ AgcDriver::Graphics::ColorTarget DecodeTarget(const Block& block, std::uint32_t 
 }
 
 void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::uint32_t inputAddr, std::span<const std::uint32_t> pixelCode,
-          std::uint32_t scissorWidth = Width, VkColorComponentFlags colorWriteMask = 0xf, std::span<const std::array<float, 4>> vertices = Triangle, bool halveDestination = false) {
+          std::uint32_t scissorWidth = Width, VkColorComponentFlags colorWriteMask = 0xf, std::span<const std::array<float, 4>> vertices = Triangle, bool halveDestination = false, bool recipe = false) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
@@ -231,7 +233,16 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     state.blend = blend;
     state.blendConstants = {0.5f, 0.5f, 0.5f, 0.5f};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(vertices.size()), 0, 1, 0, false};
-    device.Draw(state, draw, shaders);
+    if (!recipe) {
+        device.Draw(state, draw, shaders);
+        return;
+    }
+    std::shared_ptr<const AgcDriver::DrawRecipe> captured;
+    device.Draw(state, draw, shaders, {}, &captured);
+    Require(captured != nullptr, "the linear draw did not produce a reusable recipe");
+    device.WaitIdle();
+    Require(device.DrawFromRecipe(state, draw, shaders, {}, captured) == AgcDriver::RecipeOutcome::Recorded,
+            "the linear draw did not execute its cached recipe");
 }
 
 
@@ -250,7 +261,7 @@ enum class Coverage { Scissor, BlueOnly, Geometry };
 
 constexpr std::size_t TargetBytes = std::size_t{Width} * Height * 16u;
 
-bool Expect(AgcDriver::VulkanDevice& device, Block& block, Coverage coverage, bool seed = false) {
+bool Expect(AgcDriver::VulkanDevice& device, Block& block, Coverage coverage, bool seed = false, bool recipe = false) {
     using ShaderRecompiler::PixelInput;
     using ShaderRecompiler::PixelInputBit;
     constexpr std::size_t bytes = TargetBytes;
@@ -272,13 +283,21 @@ bool Expect(AgcDriver::VulkanDevice& device, Block& block, Coverage coverage, bo
     constexpr std::size_t drawnBytes = std::size_t{drawn} * 16u;
     const bool masked = coverage == Coverage::BlueOnly;
     const bool geometry = coverage == Coverage::Geometry;
-    const std::string name = seed ? "seeded scissor" : masked ? "blue-only mask" : geometry ? "partial geometry" : "unseeded scissor";
+    const std::string name = recipe ? "cached recipe" : seed ? "seeded scissor" : masked ? "blue-only mask" : geometry ? "partial geometry" : "unseeded scissor";
     if (seed) {
         for (std::uint32_t y = 0; y < Height; ++y) std::memset(block.data + y * rowBytes, 0x5a, drawnBytes);
     }
+    std::unique_ptr<Block> recipeVertices;
+    auto vertices = geometry ? std::span<const std::array<float, 4>>(LeftHalf) : std::span<const std::array<float, 4>>(Triangle);
+    if (recipe) {
+        recipeVertices = std::make_unique<Block>(BlockBytes);
+        std::memcpy(recipeVertices->data, vertices.data(), vertices.size_bytes());
+        Require(AgcDriver::Graphics::HostImportFor(context, recipeVertices->Address(), vertices.size_bytes()) != nullptr,
+                "the recipe fixture requires host-imported vertex data");
+        vertices = {reinterpret_cast<const std::array<float, 4>*>(recipeVertices->data), vertices.size()};
+    }
     Draw(device, color, PixelInputBit(PixelInput::PositionFixedPoint), Program(0u, NoInput, 0xf4u),
-         geometry ? Width : drawn, masked ? VK_COLOR_COMPONENT_B_BIT : 0xf,
-         geometry ? std::span<const std::array<float, 4>>(LeftHalf) : std::span<const std::array<float, 4>>(Triangle));
+         geometry ? Width : drawn, masked ? VK_COLOR_COMPONENT_B_BIT : 0xf, vertices, false, recipe);
     recorder = AgcDriver::Graphics::Recorder::Active();
     Require(!resident || (recorder != nullptr && !recorder->Idle()), name + ": the second draw waited for the GPU instead of being recorded");
     for (std::uint32_t y = 0; y < Height; ++y) {
@@ -355,6 +374,49 @@ bool ExpectSubwordWrites(AgcDriver::VulkanDevice& device, Block& block) {
     Require(!resident || (recorder != nullptr && !recorder->Idle()), "RGBA8 destination blend waited for the GPU instead of being recorded");
     device.WaitIdle();
     check(0x21u, "RGBA8 destination blend must read the CPU's preserved channels");
+    return true;
+}
+
+bool ExpectQueuedDraws(AgcDriver::VulkanDevice& device, Block& block) {
+    using ShaderRecompiler::PixelInput;
+    using ShaderRecompiler::PixelInputBit;
+    std::fill(block.data, block.data + TargetBytes, std::uint8_t{0xff});
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    if (AgcDriver::Graphics::HostImportFor(context, block.Address(), TargetBytes) == nullptr) return false;
+    const auto color = DecodeTarget(block, Rgba32FloatInfo);
+    Draw(device, color, PixelInputBit(PixelInput::PositionFixedPoint), Program(0u, NoInput));
+    device.WaitIdle();
+    Check(std::vector<std::uint8_t>(block.data, block.data + TargetBytes), "queued draw baseline");
+    const bool resident = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+    for (const auto [width, blue] : {std::pair{Width / 2u, 0xf4u}, std::pair{Width / 4u, 0xf2u}}) {
+        Draw(device, color, PixelInputBit(PixelInput::PositionFixedPoint), Program(0u, NoInput, blue), width, VK_COLOR_COMPONENT_B_BIT);
+        const auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        Require(!resident || (recorder != nullptr && !recorder->Idle()), "an overlapping linear draw waited for the GPU instead of being recorded");
+    }
+    constexpr float cpu = 64.0f;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            auto* texel = block.data + (std::size_t{y} * Width + x) * 16u;
+            for (const auto channel : {0u, 1u, 3u}) std::memcpy(texel + channel * sizeof(float), &cpu, sizeof(cpu));
+            if (x >= Width / 2u) std::memcpy(texel + 2u * sizeof(float), &cpu, sizeof(cpu));
+        }
+    }
+    const auto check = [&](float channels, const std::string& name) {
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                std::array<float, 4> texel{};
+                std::memcpy(texel.data(), block.data + (std::size_t{y} * Width + x) * 16u, sizeof(texel));
+                const std::array<float, 4> expected{channels, channels, x < Width / 4u ? 1.0f : x < Width / 2u ? 2.0f : cpu, channels};
+                Require(texel == expected, name + ": unexpected pixel at (" + std::to_string(x) + ", " + std::to_string(y) + ")");
+            }
+        }
+    };
+    device.WaitIdle();
+    check(cpu, "queued overlapping draws and untouched CPU bytes");
+    Draw(device, color, PixelInputBit(PixelInput::PositionFixedPoint), Program(0u, NoInput), Width,
+         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_A_BIT, Triangle, true);
+    device.WaitIdle();
+    check(cpu / 2.0f, "queued draw refresh must upload preserved CPU channels");
     return true;
 }
 
@@ -496,11 +558,17 @@ void ExpectChangedRetile(AgcDriver::VulkanDevice& device) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         std::printf("linear target resident device: %s\n", device->DeviceName().c_str());
+        if (argc == 2 && std::string(argv[1]) == "--recipe") {
+            Block recipe(BlockBytes);
+            Require(Expect(*device, recipe, Coverage::Scissor, false, true), "the recipe fixture requires a host-imported linear target");
+            std::puts("linear target cached recipe tests passed");
+            return 0;
+        }
         ExpectChangedRetile(*device);
         ExpectCpuSnapshot(*device);
         Block unseeded(BlockBytes);
@@ -508,8 +576,10 @@ int main() {
         Block masked(BlockBytes);
         Block geometry(BlockBytes);
         Block subword(BlockBytes);
+        Block queued(BlockBytes);
         if (!Expect(*device, unseeded, Coverage::Scissor) || !Expect(*device, seeded, Coverage::Scissor, true) ||
-            !Expect(*device, masked, Coverage::BlueOnly) || !Expect(*device, geometry, Coverage::Geometry) || !ExpectSubwordWrites(*device, subword)) {
+            !Expect(*device, masked, Coverage::BlueOnly) || !Expect(*device, geometry, Coverage::Geometry) ||
+            !ExpectSubwordWrites(*device, subword) || !ExpectQueuedDraws(*device, queued)) {
             std::puts("linear target resident test skipped: no host import on this device");
             return VulkanTestSkipped;
         }

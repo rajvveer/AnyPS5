@@ -238,7 +238,9 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
         return;
     }
     std::shared_ptr<const AgcDriver::DrawRecipe> captured;
-    device.Draw(state, draw, shaders, {}, &captured);
+    auto captureState = state;
+    captureState.scissor.extent.width /= 2u;
+    device.Draw(captureState, draw, shaders, {}, &captured);
     Require(captured != nullptr, "the linear draw did not produce a reusable recipe");
     device.WaitIdle();
     Require(device.DrawFromRecipe(state, draw, shaders, {}, captured) == AgcDriver::RecipeOutcome::Recorded,
@@ -420,15 +422,16 @@ bool ExpectQueuedDraws(AgcDriver::VulkanDevice& device, Block& block) {
     return true;
 }
 
-void ExpectCpuSnapshot(AgcDriver::VulkanDevice& device) {
+bool ExpectSnapshot(AgcDriver::VulkanDevice& device, bool imported) {
     using namespace AgcDriver::Graphics;
     std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
     auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    context.hostImportAlignment = 0;
+    if (!imported) context.hostImportAlignment = 0;
     TextureDetiler detiler(context);
     context.detiler = &detiler;
     Block block(2 * BlockBytes);
     std::memset(block.data, 0x11, block.bytes);
+    if (imported) std::memset(block.data, 0x22, BlockBytes);
     GuestTextureResource resource{};
     resource.baseAddress = block.Address();
     resource.width = 63;
@@ -445,11 +448,16 @@ void ExpectCpuSnapshot(AgcDriver::VulkanDevice& device) {
     const auto geometry = DescribeSurface(resource);
     const auto& mip = geometry.mips.front();
     Require(geometry.imageLayers == 2 && geometry.layerBytes == BlockBytes && geometry.guestBytes == block.bytes && mip.pitchBytes == 256,
-            "CPU snapshot fixture does not contain two padded 64 KiB layers");
-    Require(HostImportFor(context, block.Address(), block.bytes) == nullptr, "CPU snapshot fixture unexpectedly imported guest memory");
+            "linear snapshot fixture does not contain two padded 64 KiB layers");
+    const auto hostImport = HostImportFor(context, block.Address(), block.bytes);
+    if (imported && hostImport == nullptr) return false;
+    Require(imported || hostImport == nullptr, "CPU snapshot fixture unexpectedly imported guest memory");
+    const std::uint32_t drawnLayer = imported ? 1u : 0u;
+    const auto drawnOffset = geometry.GuestLayerOffset(drawnLayer);
     auto image = StorageTexture::Create(context, detiler, resource, 0);
     auto* recorder = Recorder::Active();
-    Require(recorder != nullptr, "CPU snapshot fixture has no recorder");
+    Require(recorder != nullptr, "linear snapshot fixture has no recorder");
+    recorder->Sync();
     constexpr std::uint32_t drawn = 31;
     auto upload = std::make_shared<Buffer>(context, drawn * resource.height * 4u, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     std::fill(upload->Bytes().begin(), upload->Bytes().end(), std::byte{0x22});
@@ -460,23 +468,23 @@ void ExpectCpuSnapshot(AgcDriver::VulkanDevice& device) {
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     VkBufferImageCopy write{};
-    write.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    write.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, drawnLayer, 1};
     write.imageExtent = {drawn, resource.height, 1};
     context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, upload->Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &write);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     for (std::uint32_t row = 0; row < resource.height; ++row) {
-        auto* pixels = block.data + row * mip.pitchBytes;
+        auto* pixels = block.data + drawnOffset + row * mip.pitchBytes;
         std::memset(pixels + drawn * 4u, 0x42, (resource.width - drawn) * 4u);
         std::memset(pixels + resource.width * 4u, 0x55, mip.pitchBytes - resource.width * 4u);
     }
-    std::memset(block.data + geometry.layerBytes, 0x66, static_cast<std::size_t>(geometry.layerBytes));
+    std::memset(block.data + geometry.GuestLayerOffset(1u - drawnLayer), 0x66, static_cast<std::size_t>(geometry.layerBytes));
     std::vector<std::uint8_t> expected(block.data, block.data + block.bytes);
-    for (std::uint32_t row = 0; row < resource.height; ++row) std::memset(expected.data() + row * mip.pitchBytes, 0x22, drawn * 4u);
-    image->MarkSliceDirty(0);
+    for (std::uint32_t row = 0; row < resource.height; ++row) std::memset(expected.data() + drawnOffset + row * mip.pitchBytes, 0x22, drawn * 4u);
+    image->MarkSliceDirty(drawnLayer);
     image->FinishLinearDraw();
     recorder->Sync();
-    Require(std::equal(expected.begin(), expected.end(), block.data), "CPU snapshot write-back lost GPU bytes, CPU bytes, padding, or the untouched layer");
+    Require(std::equal(expected.begin(), expected.end(), block.data), "linear snapshot write-back lost GPU bytes, CPU bytes, padding, or the untouched layer");
     image->Refresh();
     const auto rowBytes = resource.width * 4u;
     const auto layerBytes = rowBytes * resource.height;
@@ -495,10 +503,11 @@ void ExpectCpuSnapshot(AgcDriver::VulkanDevice& device) {
         for (std::uint32_t row = 0; row < resource.height; ++row) {
             Require(std::memcmp(readback.Bytes().data() + layer * layerBytes + row * rowBytes,
                                 expected.data() + geometry.GuestLayerOffset(layer) + row * mip.pitchBytes, rowBytes) == 0,
-                    "CPU snapshot refresh did not upload preserved CPU texels");
+                    "linear snapshot refresh did not upload preserved CPU texels");
         }
     }
-    std::puts("linear target CPU snapshot, padded array layers, and refresh: passed");
+    std::printf("linear target %s snapshot, padded array layers, and refresh: passed\n", imported ? "imported" : "CPU");
+    return true;
 }
 
 void ExpectChangedRetile(AgcDriver::VulkanDevice& device) {
@@ -570,14 +579,15 @@ int main(int argc, char** argv) {
             return 0;
         }
         ExpectChangedRetile(*device);
-        ExpectCpuSnapshot(*device);
+        ExpectSnapshot(*device, false);
         Block unseeded(BlockBytes);
         Block seeded(BlockBytes);
         Block masked(BlockBytes);
         Block geometry(BlockBytes);
         Block subword(BlockBytes);
         Block queued(BlockBytes);
-        if (!Expect(*device, unseeded, Coverage::Scissor) || !Expect(*device, seeded, Coverage::Scissor, true) ||
+        if (!ExpectSnapshot(*device, true) ||
+            !Expect(*device, unseeded, Coverage::Scissor) || !Expect(*device, seeded, Coverage::Scissor, true) ||
             !Expect(*device, masked, Coverage::BlueOnly) || !Expect(*device, geometry, Coverage::Geometry) ||
             !ExpectSubwordWrites(*device, subword) || !ExpectQueuedDraws(*device, queued)) {
             std::puts("linear target resident test skipped: no host import on this device");

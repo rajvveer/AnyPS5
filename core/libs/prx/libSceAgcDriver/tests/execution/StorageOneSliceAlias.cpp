@@ -17,6 +17,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -37,7 +38,7 @@ constexpr std::uint32_t TileR64KBX = 0x1b;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 constexpr std::size_t SurfaceBytes = 65536;
-constexpr std::size_t BlockBytes = 65536;
+constexpr std::size_t BlockBytes = 1u << 20u;
 constexpr std::uint32_t Initial = 0x5a5a5a5au;
 
 alignas(256) constexpr std::array<std::uint32_t, 5> StoreCode{
@@ -162,23 +163,26 @@ void RequireOutput(std::uint32_t expected, const std::string& what) {
     }
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
+void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched, std::uint32_t pipeBankXor) {
     const auto surface = AddressOf(texels);
+    const auto* arrayTexels = texels + pipeBankXor;
+    const auto descriptor = AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(arrayTexels, Type2DArray));
+    Require(descriptor.baseAddress == surface && descriptor.pipeBankXor == pipeBankXor, "the array alias does not share its base with the requested XOR");
     std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
     AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     Store(device, texels, 0x11111111u);
     Require(StorageTexture::FindPending(surface, SurfaceBytes) != nullptr, "the 2D store left no pending image");
-    LoadArray(device, texels);
-    RequireOutput(0x11111111u, "the first load through the one-slice array");
+    LoadArray(device, arrayTexels);
+    RequireOutput(pipeBankXor == 0 ? 0x11111111u : Initial, "the first load through the one-slice array with XOR " + Hex(pipeBankXor));
     Store(device, texels, 0x22222222u);
     const auto written = StorageTexture::FindPending(surface, SurfaceBytes);
     Require(written != nullptr && written->Descriptor().dimension == AgcDriver::Graphics::TextureDimension::k2D, "the second 2D store left no pending 2D image");
-    LoadArray(device, texels);
-    RequireOutput(0x22222222u, "the second load through the one-slice array");
+    LoadArray(device, arrayTexels);
+    RequireOutput(pipeBankXor == 0 ? 0x22222222u : Initial, "the second load through the one-slice array with XOR " + Hex(pipeBankXor));
     if (watched && AgcDriver::GuestMemory::Watched(surface, SurfaceBytes)) {
-        Require(StorageTexture::FindPending(surface, SurfaceBytes) == written, "the array image's refresh wrote the 2D image's results back instead of taking them on the device");
+        if (pipeBankXor == 0) Require(StorageTexture::FindPending(surface, SurfaceBytes) == written, "the array image's refresh wrote the 2D image's results back instead of taking them on the device");
     } else {
         std::puts("the imported block is compared, not watched: taking the results on the device is not checked");
     }
@@ -186,6 +190,33 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
     device.WaitIdle();
     Require(std::count(reinterpret_cast<const std::uint32_t*>(texels), reinterpret_cast<const std::uint32_t*>(texels) + SurfaceBytes / 4u, 0x22222222u) == static_cast<std::ptrdiff_t>(Threads), "guest memory does not hold the 32 texels of the second store after the flush");
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
+}
+
+bool RunCopy(AgcDriver::VulkanDevice& device, std::uint8_t* source, std::uint32_t pipeBankXor) {
+    auto* destination = source + SurfaceBytes;
+    std::fill_n(reinterpret_cast<std::uint32_t*>(source), SurfaceBytes / 4u, Initial);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(destination), SurfaceBytes / 4u, 0xa5a5a5a5u);
+    AgcDriver::GuestMemory::CollectWrites(AddressOf(source), SurfaceBytes * 2u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Store(device, source, 0x11111111u);
+    Store(device, destination + pipeBankXor, 0x22222222u);
+    const auto target = StorageTexture::FindPending(AddressOf(destination), SurfaceBytes);
+    Require(target != nullptr && target->Descriptor().pipeBankXor == pipeBankXor, "the copy destination has no pending image with the requested XOR");
+    const auto copied = device.CopyBuffer(AddressOf(destination), AddressOf(source), SurfaceBytes, 0, SurfaceBytes, 0, 0, 0,
+                                          [](std::span<const std::byte>, std::uint64_t) {});
+    StorageTexture::FlushPending(AddressOf(source), SurfaceBytes * 2u, nullptr, "test copy");
+    device.WaitIdle();
+    if (copied.path != 2) {
+        const auto* values = reinterpret_cast<const std::uint32_t*>(source);
+        Require(std::count(values, values + SurfaceBytes / 4u, 0x11111111u) == Threads &&
+                std::count(values, values + SurfaceBytes / 4u, Initial) == SurfaceBytes / 4u - Threads,
+                "the copy source lost GPU writes or untouched bytes");
+        Require(std::equal(source, source + SurfaceBytes, destination), "a raw copy between storage images with XOR " + Hex(pipeBankXor) + " changed guest bytes");
+        if (pipeBankXor == 0) Require(copied.path == 3, "matching-XOR storage images did not use the image copy path");
+    }
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    return copied.path != 2;
 }
 
 }
@@ -197,7 +228,12 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (!watched) std::puts("guest memory has no write watch: only the texels read through the array are checked");
-        Run(*device, block.Data(), watched);
+        Run(*device, block.Data(), watched, 0);
+        Run(*device, block.Data(), watched, 0x8000u);
+        if (!RunCopy(*device, block.Data(), 0) || !RunCopy(*device, block.Data(), 0x8000u)) {
+            std::puts("storage alias copy skipped: no host import on this device");
+            return VulkanTestSkipped;
+        }
         std::puts("storage one-slice alias tests passed");
         return 0;
     } catch (const std::exception& error) {

@@ -4710,7 +4710,7 @@ std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, 
 bool StorageTexture::SameSurfaceShape(const StorageTexture& other) const {
     const auto& mine = descriptor;
     const auto& theirs = other.descriptor;
-    return guestBytes == other.guestBytes && mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && mine.format == theirs.format && storageFormat == other.storageFormat && geometry.imageLayers == other.geometry.imageLayers && geometry.imageDepth == other.geometry.imageDepth;
+    return guestBytes == other.guestBytes && mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.pipeBankXor == theirs.pipeBankXor && mine.dimension == theirs.dimension && mine.format == theirs.format && storageFormat == other.storageFormat && geometry.imageLayers == other.geometry.imageLayers && geometry.imageDepth == other.geometry.imageDepth;
 }
 
 const char* StorageTexture::CopyRefusal(const Context& context, const StorageTexture* destination, const StorageTexture& source, std::uint64_t address) {
@@ -4993,7 +4993,7 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
         // for bit, as the guest bytes would.
         const auto oneSlice = [](const GuestTextureResource& resource) { return resource.dimension == TextureDimension::k2D || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0); };
         const bool sameDimension = mine.dimension == theirs.dimension || (oneSlice(mine) && oneSlice(theirs));
-        const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && sameDimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
+        const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.pipeBankXor == theirs.pipeBankXor && sameDimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
         if (sameShape && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
     }
     return nullptr;
